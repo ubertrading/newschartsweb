@@ -220,7 +220,7 @@ var prefixInstruments = {
   'FR': ['EURUSD', 'EURJPY', 'EURGBP', 'EURCHF', 'FRA40', 'GER40', 'EUSTX50'],
   'NO': ['USDNOK', 'EURNOK', 'NOKSEK', 'NOKJPY'],
   'SE': ['USDSEK', 'EURSEK', 'NOKSEK', 'SEKJPY'],
-  'NZ': ['NZDUSD', 'NZDJPY', 'EURNZD', 'GBPNZD', 'NZDCHF', 'NZDCAD'],
+  'NZ': ['NZDUSD', 'NZDJPY', 'EURNZD', 'GBPNZD', 'NZDCHF', 'NZDCAD', 'AUDNZD'],
   'CH': ['USDCHF', 'CHFJPY', 'EURCHF', 'GBPCHF', 'AUDCHF', 'CADCHF'],
   'CZ': ['USDCZK', 'EURCZK'],
   'HU': ['USDHUF', 'EURHUF'],
@@ -282,8 +282,8 @@ function openDukasMultiChart(btn) {
     return;
   }
   
-  // Dukascopy does not support NZDCAD tick data, so we strip it out specifically for the DUKA+ charts
-  instruments = instruments.filter(function(sym) { return sym !== 'NZDCAD'; });
+  // Dukascopy does not support NZDCAD or AUDNZD tick data, so we strip them out specifically for the DUKA+ charts
+  instruments = instruments.filter(function(sym) { return sym !== 'NZDCAD' && sym !== 'AUDNZD'; });
 
   var params = $.param({
     id: $btn.data('newsid'),

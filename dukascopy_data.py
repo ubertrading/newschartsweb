@@ -157,7 +157,7 @@ def _cache_path(url):
     return os.path.join(CACHE_DIR, suffix)
 
 
-def download_bi5(url):
+def download_bi5(url, max_retries=3):
     """Download a .bi5 file and return the LZMA-decompressed bytes.
     Uses a local file cache in cache/dukascopy/ to avoid repeat downloads.
     Returns empty bytes on 404, timeout, or decompression failure."""
@@ -176,7 +176,6 @@ def download_bi5(url):
     import time
     import random
     
-    max_retries = 3
     for attempt in range(max_retries):
         try:
             resp = urlopen(req, timeout=30)
@@ -206,7 +205,14 @@ def download_bi5(url):
                 break  # Successful fetch and decompress
         except HTTPError as e:
             if e.code == 404:
-                return b""  # 404 → cache as empty file
+                # Persist an empty marker so future requests skip the CDN for this file
+                try:
+                    os.makedirs(os.path.dirname(cached), exist_ok=True)
+                    with open(cached, "wb") as f:
+                        f.write(b"")
+                except OSError:
+                    pass
+                return b""
             if e.code in (503, 502, 504, 429) and attempt < max_retries - 1:
                 sleep_time = (2 ** attempt) + random.uniform(0.1, 1.0)
                 _debug_log.append("HTTP {} for {}. Retrying in {:.2f}s...".format(e.code, url.split("/")[-1], sleep_time))
@@ -303,8 +309,11 @@ def fetch_m1_data(symbol, event_dt):
                int32 low, int32 high, float32 volume
 
     Fallback: If BID_candles_min_1.bi5 is missing (e.g. for the current day),
-              automatically synthesize M1 OHLC candles from hourly tick files.
+              automatically synthesize M1 OHLC candles from hourly tick files
+              and cache the result as a JSON sidecar file for fast subsequent loads.
     """
+    today_utc = datetime.now(timezone.utc).date()
+
     point = get_point_value(symbol)
     start = event_dt - timedelta(minutes=10)
     end   = event_dt + timedelta(minutes=60)
@@ -315,7 +324,31 @@ def fetch_m1_data(symbol, event_dt):
         url = "{}/{}/{}/{:02d}/{:02d}/BID_candles_min_1.bi5".format(
             CDN_BASE, symbol, day_dt.year, m0, day_dt.day)
 
-        raw = download_bi5(url)
+        # ── JSON sidecar cache for synthesized candles ────────────────
+        # Used when the official daily file isn't available yet (current day).
+        sidecar_path = os.path.join(
+            CACHE_DIR, symbol, str(day_dt.year),
+            "{:02d}".format(m0), "{:02d}".format(day_dt.day),
+            "synthesized_m1.json")
+        if os.path.exists(sidecar_path):
+            try:
+                with open(sidecar_path, "r") as f:
+                    day_candles = json.load(f)
+                # Filter to the requested window and add to results
+                for c in day_candles:
+                    cdt = datetime.strptime(c["DateTime"][:19], "%Y-%m-%d %H:%M:%S")
+                    if start <= cdt <= end:
+                        candles.append(c)
+                _debug_log.append("synthesized_m1 sidecar hit: {}".format(sidecar_path))
+                continue
+            except (OSError, ValueError, KeyError):
+                pass  # Corrupt sidecar — fall through and re-synthesize
+
+        # ── try official daily candle file ───────────────────────────
+        # For today's date, the file likely doesn't exist yet; use only 1 attempt
+        # to avoid wasting several seconds on retries before falling through.
+        is_today = (day_dt.date() == today_utc)
+        raw = download_bi5(url, max_retries=1 if is_today else 3)
         if raw:
             rec_size = 24
             for i in range(len(raw) // rec_size):
@@ -372,9 +405,10 @@ def fetch_m1_data(symbol, event_dt):
                             b["low"] = bid
                         b["close"] = bid
 
+            day_candles = []
             for m_dt in sorted(minute_buckets.keys()):
                 b = minute_buckets[m_dt]
-                candles.append({
+                day_candles.append({
                     "DateTime": m_dt.strftime("%Y-%m-%d %H:%M:%S.000000"),
                     "BidOpen":  b["open"],
                     "BidClose": b["close"],
@@ -382,7 +416,25 @@ def fetch_m1_data(symbol, event_dt):
                     "BidHigh":  b["high"],
                 })
 
+            # ── persist synthesized candles as JSON sidecar ───────────
+            # This covers the full day window so future requests with any
+            # event time on this date also benefit from the cache.
+            if day_candles:
+                try:
+                    os.makedirs(os.path.dirname(sidecar_path), exist_ok=True)
+                    with open(sidecar_path, "w") as f:
+                        json.dump(day_candles, f)
+                    _debug_log.append("synthesized_m1 sidecar written: {}".format(sidecar_path))
+                except OSError as e:
+                    _debug_log.append("sidecar write error: {}".format(e))
+
+            for c in day_candles:
+                cdt = datetime.strptime(c["DateTime"][:19], "%Y-%m-%d %H:%M:%S")
+                if start <= cdt <= end:
+                    candles.append(c)
+
     return {"status": "OK", "data": candles}
+
 
 
 # ── main ─────────────────────────────────────────────────────────────
