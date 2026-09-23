@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
-CDN_BASE = "https://datafeed.dukascopy.com/datafeed"
+CDN_BASE = "http://datafeed.dukascopy.com/datafeed"
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "dukascopy")
 
 # ── Symbol mapping: common name → Dukascopy CDN symbol ──────────────
@@ -213,8 +213,8 @@ def download_bi5(url):
                 time.sleep(sleep_time)
                 continue
             _debug_log.append("HTTP {}: {}".format(e.code, url))
-            raise
-        except (URLError, EOFError) as e:
+            return b""
+        except (URLError, EOFError, OSError, TimeoutError) as e:
             if attempt < max_retries - 1:
                 sleep_time = (2 ** attempt) + random.uniform(0.1, 1.0)
                 time.sleep(sleep_time)
@@ -301,6 +301,9 @@ def fetch_m1_data(symbol, event_dt):
     Record   : 24 bytes  (>iiiiif)
                int32 ms-offset-from-day-start, int32 open, int32 close,
                int32 low, int32 high, float32 volume
+
+    Fallback: If BID_candles_min_1.bi5 is missing (e.g. for the current day),
+              automatically synthesize M1 OHLC candles from hourly tick files.
     """
     point = get_point_value(symbol)
     start = event_dt - timedelta(minutes=10)
@@ -313,25 +316,71 @@ def fetch_m1_data(symbol, event_dt):
             CDN_BASE, symbol, day_dt.year, m0, day_dt.day)
 
         raw = download_bi5(url)
-        if not raw:
-            continue
+        if raw:
+            rec_size = 24
+            for i in range(len(raw) // rec_size):
+                ms, o, c, l, h, vol = struct.unpack_from(">iiiiif", raw, i * rec_size)
+                candle_time = day_dt + timedelta(seconds=ms)
+                if candle_time < start or candle_time > end:
+                    continue
 
-        rec_size = 24
-        for i in range(len(raw) // rec_size):
-            ms, o, c, l, h, vol = struct.unpack_from(">iiiiif", raw, i * rec_size)
-            candle_time = day_dt + timedelta(seconds=ms)
-            if candle_time < start or candle_time > end:
-                continue
+                dt_str = candle_time.strftime("%Y-%m-%d %H:%M:%S.") + \
+                         "{:03d}000".format(candle_time.microsecond // 1000)
+                candles.append({
+                    "DateTime": dt_str,
+                    "BidOpen":  round(o / point, 6),
+                    "BidClose": round(c / point, 6),
+                    "BidLow":   round(l / point, 6),
+                    "BidHigh":  round(h / point, 6),
+                })
+        else:
+            # Daily candle file not yet generated/available (e.g. today's events).
+            # Synthesize M1 candles from hourly tick files for this date range.
+            day_start = max(start, day_dt)
+            day_end = min(end, day_dt + timedelta(days=1) - timedelta(microseconds=1))
 
-            dt_str = candle_time.strftime("%Y-%m-%d %H:%M:%S.") + \
-                     "{:03d}000".format(candle_time.microsecond // 1000)
-            candles.append({
-                "DateTime": dt_str,
-                "BidOpen":  round(o / point, 6),
-                "BidClose": round(c / point, 6),
-                "BidLow":   round(l / point, 6),
-                "BidHigh":  round(h / point, 6),
-            })
+            minute_buckets = {}
+            for hour_dt in _hour_range(day_start, day_end):
+                m0_h = hour_dt.month - 1
+                h_url = "{}/{}/{}/{:02d}/{:02d}/{:02d}h_ticks.bi5".format(
+                    CDN_BASE, symbol, hour_dt.year, m0_h, hour_dt.day, hour_dt.hour)
+                h_raw = download_bi5(h_url)
+                if not h_raw:
+                    continue
+
+                rec_size = 20
+                for i in range(len(h_raw) // rec_size):
+                    ms, _ask_i, bid_i, _av, _bv = struct.unpack_from(">iiiff", h_raw, i * rec_size)
+                    tick_time = hour_dt + timedelta(milliseconds=ms)
+                    if tick_time < start or tick_time > end:
+                        continue
+
+                    m_dt = tick_time.replace(second=0, microsecond=0)
+                    bid = round(bid_i / point, 6)
+                    if m_dt not in minute_buckets:
+                        minute_buckets[m_dt] = {
+                            "open": bid,
+                            "high": bid,
+                            "low": bid,
+                            "close": bid,
+                        }
+                    else:
+                        b = minute_buckets[m_dt]
+                        if bid > b["high"]:
+                            b["high"] = bid
+                        if bid < b["low"]:
+                            b["low"] = bid
+                        b["close"] = bid
+
+            for m_dt in sorted(minute_buckets.keys()):
+                b = minute_buckets[m_dt]
+                candles.append({
+                    "DateTime": m_dt.strftime("%Y-%m-%d %H:%M:%S.000000"),
+                    "BidOpen":  b["open"],
+                    "BidClose": b["close"],
+                    "BidLow":   b["low"],
+                    "BidHigh":  b["high"],
+                })
 
     return {"status": "OK", "data": candles}
 
