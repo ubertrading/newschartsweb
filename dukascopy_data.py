@@ -18,6 +18,7 @@ Output: JSON to stdout
 import sys
 import os
 import json
+import gzip
 import struct
 import lzma
 from datetime import datetime, timedelta, timezone
@@ -25,12 +26,14 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
 CDN_BASE = "http://datafeed.dukascopy.com/datafeed"
+# Per-event cache: stores only the filtered rows for this event window.
+# Raw CDN .bi5 files are downloaded to memory only — never written to disk.
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "dukascopy")
 
-# ── Symbol mapping: common name → Dukascopy CDN symbol ──────────────
+# -- Symbol mapping: common name -> Dukascopy CDN symbol ---------------------
 # The dropdown sends names like "US30", "SPX500", etc.
 # Dukascopy's CDN uses names like "USA30IDXUSD", "USA500IDXUSD", etc.
-# Forex pairs (e.g. EURUSD) need no mapping — they pass through as-is.
+# Forex pairs (e.g. EURUSD) need no mapping -- they pass through as-is.
 SYMBOL_MAP = {
     # US indices
     "US30":      "USA30IDXUSD",
@@ -86,7 +89,7 @@ SYMBOL_MAP = {
     "BCHUSD":    "BCHUSD",
 }
 
-# ── Point values (divisor to convert stored integers to price) ───────
+# -- Point values (divisor to convert stored integers to price) ---------------
 # Forex 5dp = 100000, JPY 3dp = 1000, indices 3dp = 1000, etc.
 POINT_VALUES = {
     "USA30IDXUSD":    1000,
@@ -148,34 +151,56 @@ def get_point_value(symbol):
         return 1000
     return 100000
 
+
 _debug_log = []
 
-def _cache_path(url):
-    """Convert a CDN URL to a local cache file path."""
-    # Strip the CDN base to get e.g. EURUSD/2025/02/06/13h_ticks.bi5
-    suffix = url.replace(CDN_BASE + "/", "")
-    return os.path.join(CACHE_DIR, suffix)
+
+# ---------------------------------------------------------------------------
+# Per-event cache helpers (tiny per-event .json.gz, no full .bi5 on disk)
+# ---------------------------------------------------------------------------
+
+def _event_cache_path(symbol, start_ts, end_ts, timeframe):
+    """Return path for a per-event cache file (just the filtered rows)."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    fname = "{}_{}_{}_{}.json.gz".format(symbol, timeframe, int(start_ts), int(end_ts))
+    return os.path.join(CACHE_DIR, fname)
+
+
+def _read_event_cache(symbol, start_ts, end_ts, timeframe):
+    """Return cached row list or None on miss."""
+    path = _event_cache_path(symbol, start_ts, end_ts, timeframe)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as fh:
+                return json.loads(gzip.decompress(fh.read()).decode("utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _write_event_cache(symbol, start_ts, end_ts, timeframe, rows):
+    """Persist the filtered rows for this event window."""
+    path = _event_cache_path(symbol, start_ts, end_ts, timeframe)
+    try:
+        payload = json.dumps(rows, separators=(",", ":")).encode("utf-8")
+        with open(path, "wb") as fh:
+            fh.write(gzip.compress(payload, compresslevel=6))
+    except Exception:
+        pass
 
 
 def download_bi5(url, max_retries=3):
-    """Download a .bi5 file and return the LZMA-decompressed bytes.
-    Uses a local file cache in cache/dukascopy/ to avoid repeat downloads.
+    """Download a .bi5 file to memory and return the LZMA-decompressed bytes.
+    Files are NOT cached to disk -- only the per-event filtered results are cached.
     Returns empty bytes on 404, timeout, or decompression failure."""
 
-    # ── check cache first ────────────────────────────────────────────
-    cached = _cache_path(url)
-    if os.path.exists(cached):
-        with open(cached, "rb") as f:
-            return f.read()          # may be b"" (cached 404)
+    import time
+    import random
 
-    # ── download from CDN ────────────────────────────────────────────
     req = Request(url)
     req.add_header("User-Agent", "Mozilla/5.0")
     decompressed = b""
-    
-    import time
-    import random
-    
+
     for attempt in range(max_retries):
         try:
             resp = urlopen(req, timeout=30)
@@ -183,58 +208,38 @@ def download_bi5(url, max_retries=3):
             if not data:
                 _debug_log.append("empty response: {}".format(url))
                 break
-            else:
-                # Try standard LZMA/XZ decompression first
+            # Try standard LZMA/XZ decompression first
+            try:
+                decompressed = lzma.decompress(data)
+            except lzma.LZMAError:
+                pass
+            if not decompressed:
                 try:
-                    decompressed = lzma.decompress(data)
+                    decompressed = lzma.decompress(data, format=lzma.FORMAT_ALONE)
                 except lzma.LZMAError:
                     pass
-                if not decompressed:
-                    # Some Dukascopy files use raw LZMA1 (no XZ container)
-                    try:
-                        decompressed = lzma.decompress(data, format=lzma.FORMAT_ALONE)
-                    except lzma.LZMAError:
-                        pass
-                if not decompressed:
-                    try:
-                        decompressed = lzma.decompress(data, format=lzma.FORMAT_RAW,
-                                                       filters=[{"id": lzma.FILTER_LZMA1}])
-                    except lzma.LZMAError as e:
-                        _debug_log.append("LZMA fail {}: {} (raw_len={})".format(
-                            url.split("/")[-1], e, len(data)))
-                break  # Successful fetch and decompress
+            if not decompressed:
+                try:
+                    decompressed = lzma.decompress(data, format=lzma.FORMAT_RAW,
+                                                   filters=[{"id": lzma.FILTER_LZMA1}])
+                except lzma.LZMAError as e:
+                    _debug_log.append("LZMA fail {}: {} (raw_len={})".format(
+                        url.split("/")[-1], e, len(data)))
+            break  # successful fetch
         except HTTPError as e:
             if e.code == 404:
-                # Persist an empty marker so future requests skip the CDN for this file
-                try:
-                    os.makedirs(os.path.dirname(cached), exist_ok=True)
-                    with open(cached, "wb") as f:
-                        f.write(b"")
-                except OSError:
-                    pass
                 return b""
             if e.code in (503, 502, 504, 429) and attempt < max_retries - 1:
-                sleep_time = (2 ** attempt) + random.uniform(0.1, 1.0)
-                _debug_log.append("HTTP {} for {}. Retrying in {:.2f}s...".format(e.code, url.split("/")[-1], sleep_time))
-                time.sleep(sleep_time)
+                time.sleep((2 ** attempt) + random.uniform(0.1, 1.0))
                 continue
             _debug_log.append("HTTP {}: {}".format(e.code, url))
             return b""
         except (URLError, EOFError, OSError, TimeoutError) as e:
             if attempt < max_retries - 1:
-                sleep_time = (2 ** attempt) + random.uniform(0.1, 1.0)
-                time.sleep(sleep_time)
+                time.sleep((2 ** attempt) + random.uniform(0.1, 1.0))
                 continue
             _debug_log.append("DL error: {} {}".format(url, e))
-            return b""   # network error: don't cache, retry next time
-
-    # ── save to cache (including empty = 404 / no data) ──────────────
-    try:
-        os.makedirs(os.path.dirname(cached), exist_ok=True)
-        with open(cached, "wb") as f:
-            f.write(decompressed)
-    except OSError as e:
-        _debug_log.append("cache write error: {}".format(e))
+            return b""
 
     return decompressed
 
@@ -247,19 +252,28 @@ def _hour_range(start, end):
         t += timedelta(hours=1)
 
 
-# ── tick data ────────────────────────────────────────────────────────
+# -- tick data ----------------------------------------------------------------
 
 def fetch_tick_data(symbol, event_dt):
-    """Fetch tick data ±60 seconds around the event.
+    """Fetch tick data +-60 seconds around the event.
 
     CDN path : {SYMBOL}/{YEAR}/{MONTH_0:02d}/{DAY:02d}/{HOUR:02d}h_ticks.bi5
     Record   : 20 bytes  (>iiiff)
                int32 ms-offset-from-hour, int32 ask, int32 bid,
                float32 ask_vol, float32 bid_vol
+
+    Caching: per-event .json.gz -- raw .bi5 files are NOT kept on disk.
     """
     point = get_point_value(symbol)
     start = event_dt - timedelta(seconds=60)
     end   = event_dt + timedelta(seconds=60)
+    start_ts = start.timestamp()
+    end_ts   = end.timestamp()
+
+    # Per-event cache check
+    cached = _read_event_cache(symbol, start_ts, end_ts, "t1")
+    if cached is not None:
+        return {"status": "OK", "data": cached}
 
     ticks = []
     for hour_dt in _hour_range(start, end):
@@ -286,10 +300,11 @@ def fetch_tick_data(symbol, event_dt):
                 "Ask": round(ask_i / point, 6),
             })
 
+    _write_event_cache(symbol, start_ts, end_ts, "t1", ticks)
     return {"status": "OK", "data": ticks}
 
 
-# ── M1 candle data ──────────────────────────────────────────────────
+# -- M1 candle data -----------------------------------------------------------
 
 def _day_range(start, end):
     """Yield each truncated-to-day datetime between start and end."""
@@ -300,23 +315,31 @@ def _day_range(start, end):
 
 
 def fetch_m1_data(symbol, event_dt):
-    """Fetch M1 BID candles –10 min to +60 min around the event.
+    """Fetch M1 BID candles -10 min to +120 min around the event.
 
     CDN path : {SYMBOL}/{YEAR}/{MONTH_0:02d}/{DAY:02d}/BID_candles_min_1.bi5
-               (daily file – NOT per-hour)
+               (daily file - NOT per-hour)
     Record   : 24 bytes  (>iiiiif)
                int32 ms-offset-from-day-start, int32 open, int32 close,
                int32 low, int32 high, float32 volume
 
-    Fallback: If BID_candles_min_1.bi5 is missing (e.g. for the current day),
-              automatically synthesize M1 OHLC candles from hourly tick files
-              and cache the result as a JSON sidecar file for fast subsequent loads.
+    Fallback: If BID_candles_min_1.bi5 is missing (current day not yet published),
+              synthesize M1 candles from hourly tick files.
+
+    Caching: per-event .json.gz -- raw .bi5 files are NOT kept on disk.
     """
     today_utc = datetime.now(timezone.utc).date()
 
     point = get_point_value(symbol)
     start = event_dt - timedelta(minutes=10)
-    end   = event_dt + timedelta(minutes=60)
+    end   = event_dt + timedelta(minutes=120)
+    start_ts = start.timestamp()
+    end_ts   = end.timestamp()
+
+    # Per-event cache check
+    cached = _read_event_cache(symbol, start_ts, end_ts, "m1")
+    if cached is not None:
+        return {"status": "OK", "data": cached}
 
     candles = []
     for day_dt in _day_range(start, end):
@@ -324,29 +347,7 @@ def fetch_m1_data(symbol, event_dt):
         url = "{}/{}/{}/{:02d}/{:02d}/BID_candles_min_1.bi5".format(
             CDN_BASE, symbol, day_dt.year, m0, day_dt.day)
 
-        # ── JSON sidecar cache for synthesized candles ────────────────
-        # Used when the official daily file isn't available yet (current day).
-        sidecar_path = os.path.join(
-            CACHE_DIR, symbol, str(day_dt.year),
-            "{:02d}".format(m0), "{:02d}".format(day_dt.day),
-            "synthesized_m1.json")
-        if os.path.exists(sidecar_path):
-            try:
-                with open(sidecar_path, "r") as f:
-                    day_candles = json.load(f)
-                # Filter to the requested window and add to results
-                for c in day_candles:
-                    cdt = datetime.strptime(c["DateTime"][:19], "%Y-%m-%d %H:%M:%S")
-                    if start <= cdt <= end:
-                        candles.append(c)
-                _debug_log.append("synthesized_m1 sidecar hit: {}".format(sidecar_path))
-                continue
-            except (OSError, ValueError, KeyError):
-                pass  # Corrupt sidecar — fall through and re-synthesize
-
-        # ── try official daily candle file ───────────────────────────
-        # For today's date, the file likely doesn't exist yet; use only 1 attempt
-        # to avoid wasting several seconds on retries before falling through.
+        # For today's date, the file likely doesn't exist yet; 1 attempt only
         is_today = (day_dt.date() == today_utc)
         raw = download_bi5(url, max_retries=1 if is_today else 3)
         if raw:
@@ -367,8 +368,7 @@ def fetch_m1_data(symbol, event_dt):
                     "BidHigh":  round(h / point, 6),
                 })
         else:
-            # Daily candle file not yet generated/available (e.g. today's events).
-            # Synthesize M1 candles from hourly tick files for this date range.
+            # Daily candle file not yet published -- synthesize from hourly tick files
             day_start = max(start, day_dt)
             day_end = min(end, day_dt + timedelta(days=1) - timedelta(microseconds=1))
 
@@ -391,24 +391,16 @@ def fetch_m1_data(symbol, event_dt):
                     m_dt = tick_time.replace(second=0, microsecond=0)
                     bid = round(bid_i / point, 6)
                     if m_dt not in minute_buckets:
-                        minute_buckets[m_dt] = {
-                            "open": bid,
-                            "high": bid,
-                            "low": bid,
-                            "close": bid,
-                        }
+                        minute_buckets[m_dt] = {"open": bid, "high": bid, "low": bid, "close": bid}
                     else:
                         b = minute_buckets[m_dt]
-                        if bid > b["high"]:
-                            b["high"] = bid
-                        if bid < b["low"]:
-                            b["low"] = bid
+                        if bid > b["high"]: b["high"] = bid
+                        if bid < b["low"]:  b["low"]  = bid
                         b["close"] = bid
 
-            day_candles = []
             for m_dt in sorted(minute_buckets.keys()):
                 b = minute_buckets[m_dt]
-                day_candles.append({
+                candles.append({
                     "DateTime": m_dt.strftime("%Y-%m-%d %H:%M:%S.000000"),
                     "BidOpen":  b["open"],
                     "BidClose": b["close"],
@@ -416,28 +408,11 @@ def fetch_m1_data(symbol, event_dt):
                     "BidHigh":  b["high"],
                 })
 
-            # ── persist synthesized candles as JSON sidecar ───────────
-            # This covers the full day window so future requests with any
-            # event time on this date also benefit from the cache.
-            if day_candles:
-                try:
-                    os.makedirs(os.path.dirname(sidecar_path), exist_ok=True)
-                    with open(sidecar_path, "w") as f:
-                        json.dump(day_candles, f)
-                    _debug_log.append("synthesized_m1 sidecar written: {}".format(sidecar_path))
-                except OSError as e:
-                    _debug_log.append("sidecar write error: {}".format(e))
-
-            for c in day_candles:
-                cdt = datetime.strptime(c["DateTime"][:19], "%Y-%m-%d %H:%M:%S")
-                if start <= cdt <= end:
-                    candles.append(c)
-
+    _write_event_cache(symbol, start_ts, end_ts, "m1", candles)
     return {"status": "OK", "data": candles}
 
 
-
-# ── main ─────────────────────────────────────────────────────────────
+# -- main ---------------------------------------------------------------------
 
 def main():
     if len(sys.argv) < 4:
@@ -450,7 +425,7 @@ def main():
     timestamp_ms = int(sys.argv[2])
     timeframe    = sys.argv[3]
 
-    # Convert ms epoch → naive UTC datetime
+    # Convert ms epoch -> naive UTC datetime
     event_dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
     event_dt = event_dt.replace(tzinfo=None)   # Dukascopy times are naive UTC
 
