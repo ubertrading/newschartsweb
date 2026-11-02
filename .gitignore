@@ -1,0 +1,31 @@
+# Runtime caches (server-side only, never commit)
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# C++ build artifacts
+GetHistPrices/build/
+GetHistPrices/debug/
+GetHistPrices/compile_commands.json
+
+# Scratch / one-off analysis files
+analyze_*.py
+deep_analysis_*.py
+post_spike_*.py
+post_spike_*.txt
+post_spike_*.json
+retrace_*.py
+retrace_*.txt
+stop_analysis.py
+t1_vs_t2_entry.py
+events_*.json
+analysis_results.json
+output.html
+output2.html
+downloaded_script.js
+dump_events.php
+scratch.php
